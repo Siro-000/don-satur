@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Bluepad32.h>
+#include <Preferences.h>
 
 // ============================================================
 // PINES ESP32 -> TB6612FNG
@@ -31,6 +32,7 @@ const int PWM_CHANNEL_B = 1;
 //   - Con un gatillo apretado: gira mientras se mueve (la rueda del lado
 //     hacia donde giras va mas lenta).
 //   - Sin gatillos: gira sobre su propio eje.
+//   Flecha arriba / abajo = sensibilidad de giro (ver NIVELES_GIRO).
 //
 // Bluepad32 entrega el stick de -511 a 512 y los gatillos de 0 a 1023.
 // Zona muerta del stick X (tiene drift). Calibracion: mirar en el monitor
@@ -44,11 +46,36 @@ const int ZONA_MUERTA_GATILLO = 40;
 // Velocidad maxima (0 a 255).
 const int VELOCIDAD_MAXIMA = 255;
 
-// Velocidad maxima al girar sobre su propio eje (0 a 255).
-// Mas bajo = mas facil apuntar a la pelota, y menos tiron si se suelta el
-// gatillo con el stick de costado (el robot pasa de curva a giro sobre su
-// eje; la rampa de velocidad suaviza ese cambio). Probar entre 140 y 180.
-const int VELOCIDAD_GIRO_SOBRE_EJE = 160;
+// ============================================================
+// SENSIBILIDAD DE GIRO (flechas arriba / abajo del mando)
+// ============================================================
+// Flecha arriba = giro mas agresivo, flecha abajo = mas suave.
+// El nivel se ve en el color de la barra de luz del mando, y queda
+// guardado en la memoria del ESP32: si el robot se reinicia, arranca con
+// el ultimo nivel usado.
+//
+// Por nivel:
+//   expo: curva del stick. 0.0 = lineal, 1.0 = muy suave en el centro
+//         (la potencia completa queda para el final del recorrido).
+//   giroSobreEje: velocidad maxima al girar sobre su propio eje (0 a 255).
+//         Mas bajo = mas facil apuntar a la pelota, y menos tiron si se
+//         suelta el gatillo con el stick de costado.
+//   r, g, b: color de la barra de luz del mando.
+struct NivelGiro {
+    float expo;
+    int giroSobreEje;
+    uint8_t r, g, b;
+};
+
+const NivelGiro NIVELES_GIRO[] = {
+    {0.8, 120,   0,   0, 255},   // 1: muy suave, para apuntar fino (azul)
+    {0.7, 140,   0, 180, 255},   // 2 (celeste)
+    {0.6, 160,   0, 255,   0},   // 3: normal (verde)
+    {0.4, 200, 255, 180,   0},   // 4 (amarillo)
+    {0.2, 255, 255,   0,   0},   // 5: agresivo (rojo)
+};
+const int CANTIDAD_NIVELES = sizeof(NIVELES_GIRO) / sizeof(NIVELES_GIRO[0]);
+const int NIVEL_GIRO_INICIAL = 3;
 
 // Que tan cerrado gira en marcha, con el stick a fondo:
 //   0.0 = la rueda de adentro queda frenada (curva suave)
@@ -223,6 +250,53 @@ int procesarGatillo(int valor) {
     return constrain(magnitud, 0, VELOCIDAD_MAXIMA);
 }
 
+// Curva exponencial para un valor de -VELOCIDAD_MAXIMA a VELOCIDAD_MAXIMA.
+// Con expo = 0.6, el stick a la mitad da ~27% en vez de 50%; a fondo sigue
+// dando el 100%.
+int aplicarExpo(int valor, float expo) {
+    float n = (float)valor / VELOCIDAD_MAXIMA;            // -1.0 a 1.0
+    n = expo * n * n * n + (1.0 - expo) * n;
+    return (int)(n * VELOCIDAD_MAXIMA);
+}
+
+// ============================================================
+// SENSIBILIDAD DE GIRO
+// ============================================================
+Preferences preferencias;
+int nivelGiro = NIVEL_GIRO_INICIAL;   // 1 a CANTIDAD_NIVELES
+uint8_t dpadAnterior = 0;             // para detectar el momento en que se aprieta
+
+const NivelGiro& nivelActual() {
+    return NIVELES_GIRO[nivelGiro - 1];
+}
+
+void mostrarNivelGiro() {
+    if (!miControl) return;
+    const NivelGiro& n = nivelActual();
+    miControl->setColorLED(n.r, n.g, n.b);
+}
+
+void cambiarNivelGiro(int delta) {
+    int nuevo = constrain(nivelGiro + delta, 1, CANTIDAD_NIVELES);
+    if (nuevo == nivelGiro) return;   // ya esta en el limite
+    nivelGiro = nuevo;
+    preferencias.putInt("nivelGiro", nivelGiro);
+    mostrarNivelGiro();
+    // Vibracion corta para confirmar el cambio
+    miControl->playDualRumble(0, 80, 0x80, 0x40);
+    Serial.printf("Sensibilidad de giro: nivel %d\n", nivelGiro);
+}
+
+// Un toque = un nivel: solo cuenta el momento en que se aprieta la flecha,
+// no mientras se mantiene apretada (el loop corre cada 20 ms).
+void leerBotonesSensibilidad() {
+    uint8_t dpad = miControl->dpad();
+    uint8_t recienApretados = dpad & ~dpadAnterior;
+    dpadAnterior = dpad;
+    if (recienApretados & DPAD_UP)   cambiarNivelGiro(+1);
+    if (recienApretados & DPAD_DOWN) cambiarNivelGiro(-1);
+}
+
 // ============================================================
 // EVENTOS BLUEPAD32 (PS5)
 // ============================================================
@@ -241,6 +315,8 @@ void onConnectedController(ControllerPtr ctl) {
 
     if (miControl == nullptr) {
         miControl = ctl;
+        dpadAnterior = 0;
+        mostrarNivelGiro();
         // Ya tengo mi control: no acepto conexiones nuevas
         BP32.enableNewBluetoothConnections(false);
         Serial.println();
@@ -289,6 +365,12 @@ void setup() {
 
     detenerMotores();
 
+    // Recuperar el ultimo nivel de sensibilidad de giro usado
+    preferencias.begin("donsatur", false);
+    nivelGiro = constrain(preferencias.getInt("nivelGiro", NIVEL_GIRO_INICIAL),
+                          1, CANTIDAD_NIVELES);
+    Serial.printf("Sensibilidad de giro: nivel %d\n", nivelGiro);
+
     // Iniciar Bluepad32
     BP32.setup(&onConnectedController, &onDisconnectedController);
 
@@ -318,6 +400,10 @@ void loop() {
         return;
     }
 
+    // FLECHAS ARRIBA / ABAJO: sensibilidad de giro
+    leerBotonesSensibilidad();
+    const NivelGiro& nivel = nivelActual();
+
     // LEER ENTRADAS
     // R2 = throttle (0 a 1023), L2 = brake (0 a 1023), stick izq X (-511 a 512)
     int gatilloAdelante = procesarGatillo(miControl->throttle());
@@ -329,14 +415,14 @@ void loop() {
     int avance = gatilloAdelante - gatilloAtras;
 
     // GIRO: positivo = derecha, negativo = izquierda
-    int giro = procesarEje(ejeX, ZONA_MUERTA_X);
+    int giro = aplicarExpo(procesarEje(ejeX, ZONA_MUERTA_X), nivel.expo);
 
     int velocidadA;  // izquierdo
     int velocidadB;  // derecho
 
     if (avance == 0) {
         // SIN GATILLOS: giro sobre su propio eje (una rueda para cada lado)
-        int g = map(abs(giro), 0, VELOCIDAD_MAXIMA, 0, VELOCIDAD_GIRO_SOBRE_EJE);
+        int g = map(abs(giro), 0, VELOCIDAD_MAXIMA, 0, nivel.giroSobreEje);
         g = (giro >= 0) ? g : -g;
         velocidadA = g;
         velocidadB = -g;

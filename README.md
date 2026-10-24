@@ -9,8 +9,25 @@ Firmware del robot de fútbol **Don Satur**: un ESP32 que recibe un mando de PS5
 | R2 | Avanzar (cuanto más apretado, más rápido) |
 | L2 | Retroceder |
 | Stick izquierdo (eje X) | Girar: en marcha si hay un gatillo apretado, sobre su eje si no |
+| Flecha arriba / abajo | Sensibilidad de giro: más agresivo / más suave |
 
 Si el mando se desconecta, los motores se detienen.
+
+## Sensibilidad de giro
+
+Hay 5 niveles. Cada toque de flecha sube o baja uno, el mando vibra para confirmar y la barra de luz cambia de color:
+
+| Nivel | Color | Uso |
+| --- | --- | --- |
+| 1 | Azul | Muy suave, para apuntar fino |
+| 2 | Celeste | |
+| 3 | Verde | Normal (nivel de fábrica) |
+| 4 | Amarillo | |
+| 5 | Rojo | Agresivo |
+
+Cada nivel combina una curva exponencial en el stick (el centro del recorrido queda suave y la potencia completa se guarda para el final) y la velocidad máxima de giro sobre el eje. Se ajustan en `NIVELES_GIRO`, en `src/main.cpp`.
+
+El nivel queda guardado en la memoria del ESP32: si el robot se reinicia, arranca con el último nivel usado.
 
 ## Conexiones (ESP32 → TB6612FNG)
 
