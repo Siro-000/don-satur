@@ -45,7 +45,10 @@ const int ZONA_MUERTA_GATILLO = 40;
 const int VELOCIDAD_MAXIMA = 255;
 
 // Velocidad maxima al girar sobre su propio eje (0 a 255).
-const int VELOCIDAD_GIRO_SOBRE_EJE = 255;
+// Mas bajo = mas facil apuntar a la pelota, y menos tiron si se suelta el
+// gatillo con el stick de costado (el robot pasa de curva a giro sobre su
+// eje; la rampa de velocidad suaviza ese cambio). Probar entre 140 y 180.
+const int VELOCIDAD_GIRO_SOBRE_EJE = 160;
 
 // Que tan cerrado gira en marcha, con el stick a fondo:
 //   0.0 = la rueda de adentro queda frenada (curva suave)
