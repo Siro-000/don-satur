@@ -33,6 +33,7 @@ const int PWM_CHANNEL_B = 1;
 //     hacia donde giras va mas lenta).
 //   - Sin gatillos: gira sobre su propio eje.
 //   Flecha arriba / abajo = sensibilidad de giro (ver NIVELES_GIRO).
+//   Flecha izquierda / derecha = trim, para que vaya derecho (ver TRIM).
 //
 // Bluepad32 entrega el stick de -511 a 512 y los gatillos de 0 a 1023.
 // Zona muerta del stick X (tiene drift). Calibracion: mirar en el monitor
@@ -77,11 +78,28 @@ const NivelGiro NIVELES_GIRO[] = {
 const int CANTIDAD_NIVELES = sizeof(NIVELES_GIRO) / sizeof(NIVELES_GIRO[0]);
 const int NIVEL_GIRO_INICIAL = 3;
 
+// ============================================================
+// TRIM (flechas izquierda / derecha del mando)
+// ============================================================
+// Corrige que el robot se tire para un costado yendo derecho (dos motores
+// nunca son identicos). Se toca la flecha del lado hacia donde se quiere
+// que vaya: si se tira a la derecha, flecha izquierda.
+// Cada toque mueve TRIM_PASO por ciento. El mando vibra corto en cada
+// toque y largo al volver a 0 (sin correccion). Queda guardado en la
+// memoria del ESP32, igual que el nivel de giro.
+//
+// Solo cambia la proporcion entre las ruedas, no la velocidad: si hay
+// margen acelera la rueda lenta, y solo a fondo frena la rapida.
+const int TRIM_PASO = 1;      // % por toque
+const int TRIM_MAXIMO = 20;   // % maximo para cada lado
+
 // Que tan cerrado gira en marcha, con el stick a fondo:
 //   0.0 = la rueda de adentro queda frenada (curva suave)
 //   1.0 = la rueda de adentro va a la misma velocidad pero al reves (muy cerrado)
 const float CIERRE_GIRO_EN_MARCHA = 0.0;
 
+// Multiplicador fijo de cada rueda. Para que vaya derecho conviene usar el
+// trim desde el mando (flechas izquierda / derecha) en vez de tocar esto.
 const float FACTOR_A = 1.00;
 const float FACTOR_B = 1.00;
 
@@ -287,14 +305,56 @@ void cambiarNivelGiro(int delta) {
     Serial.printf("Sensibilidad de giro: nivel %d\n", nivelGiro);
 }
 
-// Un toque = un nivel: solo cuenta el momento en que se aprieta la flecha,
+// ============================================================
+// TRIM
+// ============================================================
+// Negativo = frena la rueda izquierda (el robot va mas a la izquierda),
+// positivo = frena la rueda derecha. En %, de -TRIM_MAXIMO a TRIM_MAXIMO.
+int trim = 0;
+
+void cambiarTrim(int delta) {
+    int nuevo = constrain(trim + delta, -TRIM_MAXIMO, TRIM_MAXIMO);
+    if (nuevo == trim) return;   // ya esta en el limite
+    trim = nuevo;
+    preferencias.putInt("trim", trim);
+    if (trim == 0) {
+        miControl->playDualRumble(0, 300, 0xFF, 0xC0);   // largo: sin correccion
+        Serial.println("Trim: 0 (sin correccion)");
+    } else {
+        miControl->playDualRumble(0, 80, 0x80, 0x40);
+        Serial.printf("Trim: %d%% %s\n", abs(trim), trim < 0 ? "izquierda" : "derecha");
+    }
+}
+
+// Aplica el trim manteniendo la velocidad: la rueda "rapida" tiene que ir
+// a (100 - trim)% de la otra. Si la otra tiene margen la acelera; si no
+// (a fondo), frena la rapida.
+void aplicarTrim(int& velocidadA, int& velocidadB) {
+    if (trim == 0) return;
+    float proporcion = 1.0 - abs(trim) / 100.0;
+    int& rapida = (trim < 0) ? velocidadA : velocidadB;
+    int& lenta  = (trim < 0) ? velocidadB : velocidadA;
+
+    float lentaNueva = lenta / proporcion;
+    float escala = 1.0;
+    if (abs(lentaNueva) > VELOCIDAD_MAXIMA) escala = VELOCIDAD_MAXIMA / abs(lentaNueva);
+    lenta  = (int)(lentaNueva * escala);
+    rapida = (int)(rapida * escala);
+}
+
+// ============================================================
+// FLECHAS DEL MANDO
+// ============================================================
+// Un toque = un paso: solo cuenta el momento en que se aprieta la flecha,
 // no mientras se mantiene apretada (el loop corre cada 20 ms).
-void leerBotonesSensibilidad() {
+void leerFlechas() {
     uint8_t dpad = miControl->dpad();
     uint8_t recienApretados = dpad & ~dpadAnterior;
     dpadAnterior = dpad;
-    if (recienApretados & DPAD_UP)   cambiarNivelGiro(+1);
-    if (recienApretados & DPAD_DOWN) cambiarNivelGiro(-1);
+    if (recienApretados & DPAD_UP)    cambiarNivelGiro(+1);
+    if (recienApretados & DPAD_DOWN)  cambiarNivelGiro(-1);
+    if (recienApretados & DPAD_LEFT)  cambiarTrim(-TRIM_PASO);
+    if (recienApretados & DPAD_RIGHT) cambiarTrim(+TRIM_PASO);
 }
 
 // ============================================================
@@ -370,6 +430,8 @@ void setup() {
     nivelGiro = constrain(preferencias.getInt("nivelGiro", NIVEL_GIRO_INICIAL),
                           1, CANTIDAD_NIVELES);
     Serial.printf("Sensibilidad de giro: nivel %d\n", nivelGiro);
+    trim = constrain(preferencias.getInt("trim", 0), -TRIM_MAXIMO, TRIM_MAXIMO);
+    Serial.printf("Trim: %d%% %s\n", abs(trim), trim < 0 ? "izquierda" : "derecha");
 
     // Iniciar Bluepad32
     BP32.setup(&onConnectedController, &onDisconnectedController);
@@ -400,8 +462,8 @@ void loop() {
         return;
     }
 
-    // FLECHAS ARRIBA / ABAJO: sensibilidad de giro
-    leerBotonesSensibilidad();
+    // FLECHAS: arriba / abajo = sensibilidad de giro, izquierda / derecha = trim
+    leerFlechas();
     const NivelGiro& nivel = nivelActual();
 
     // LEER ENTRADAS
@@ -448,6 +510,9 @@ void loop() {
 
     velocidadA = constrain(velocidadA, -VELOCIDAD_MAXIMA, VELOCIDAD_MAXIMA);
     velocidadB = constrain(velocidadB, -VELOCIDAD_MAXIMA, VELOCIDAD_MAXIMA);
+
+    // TRIM: corrige que se tire para un costado
+    aplicarTrim(velocidadA, velocidadB);
 
     // RAMPA: cada rueda se acerca de a poco a la velocidad pedida
     velocidadActualA = aplicarRampa(velocidadA, velocidadActualA);

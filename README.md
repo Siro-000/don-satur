@@ -10,6 +10,7 @@ Firmware del robot de fútbol **Don Satur**: un ESP32 que recibe un mando de PS5
 | L2 | Retroceder |
 | Stick izquierdo (eje X) | Girar: en marcha si hay un gatillo apretado, sobre su eje si no |
 | Flecha arriba / abajo | Sensibilidad de giro: más agresivo / más suave |
+| Flecha izquierda / derecha | Trim: corrige que se tire para un costado |
 
 Si el mando se desconecta, los motores se detienen.
 
@@ -28,6 +29,18 @@ Hay 5 niveles. Cada toque de flecha sube o baja uno, el mando vibra para confirm
 Cada nivel combina una curva exponencial en el stick (el centro del recorrido queda suave y la potencia completa se guarda para el final) y la velocidad máxima de giro sobre el eje. Se ajustan en `NIVELES_GIRO`, en `src/main.cpp`.
 
 El nivel queda guardado en la memoria del ESP32: si el robot se reinicia, arranca con el último nivel usado.
+
+## Trim (que vaya derecho)
+
+Dos motores nunca son idénticos, así que el robot puede tirarse para un costado aunque las dos ruedas reciban lo mismo. El trim lo corrige desde el mando:
+
+1. Con R2 a fondo, ver hacia dónde se tira el robot.
+2. Tocar la flecha **del lado hacia donde se quiere que vaya**: si se tira a la derecha, flecha izquierda.
+3. Repetir hasta que vaya derecho unos 2 metros. Si se pasa, tocar la flecha contraria.
+
+Cada toque corrige un 1% (hasta 20% para cada lado). El mando vibra corto en cada toque y largo al volver a 0 (sin corrección). El trim queda guardado igual que el nivel de giro.
+
+El trim solo cambia la proporción entre las ruedas, no la velocidad: si hay margen acelera la rueda lenta, y solo con el gatillo a fondo frena la rápida.
 
 ## Conexiones (ESP32 → TB6612FNG)
 
