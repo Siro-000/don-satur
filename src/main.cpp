@@ -56,6 +56,26 @@ const float FACTOR_A = 1.00;
 const float FACTOR_B = 1.00;
 
 // ============================================================
+// RAMPA DE VELOCIDAD Y FRENO
+// ============================================================
+// Cuanto puede cambiar la velocidad de cada rueda por ciclo (el loop corre
+// cada 20 ms). Evita que un cambio brusco (R2 a fondo -> L2 a fondo)
+// invierta los motores de golpe: ese pico de corriente puede reiniciar el
+// ESP32 por caida de tension, sobre todo con la bateria baja.
+//   ACELERAR: alejarse de 0.             25 -> de 0 a 255 en ~200 ms
+//   FRENAR:   acercarse a 0 (frenar o
+//             empezar a cambiar de sentido). 50 -> de 255 a 0 en ~100 ms
+// Si el robot se sigue reiniciando, bajar los dos valores. Si se siente
+// "pesado", subirlos.
+const int RAMPA_ACELERAR = 25;
+const int RAMPA_FRENAR = 50;
+
+// Que hace la rueda cuando su velocidad llega a 0:
+//   true  = freno activo (el TB6612 pone el motor en corto y frena en seco)
+//   false = rueda libre (el robot sigue deslizando)
+const bool FRENO_ACTIVO = true;
+
+// ============================================================
 // QUE ROBOT ES ESTE
 // ============================================================
 // Normalmente lo define platformio.ini con -D ROBOT=1 / -D ROBOT=2.
@@ -126,8 +146,9 @@ void motorA(int velocidad) {
         digitalWrite(PIN_AIN2, HIGH);
         ledcWrite(PWM_CHANNEL_A, -velocidad);
     } else {
-        digitalWrite(PIN_AIN1, LOW);
-        digitalWrite(PIN_AIN2, LOW);
+        // Freno activo: IN1 = IN2 = HIGH. Rueda libre: IN1 = IN2 = LOW.
+        digitalWrite(PIN_AIN1, FRENO_ACTIVO ? HIGH : LOW);
+        digitalWrite(PIN_AIN2, FRENO_ACTIVO ? HIGH : LOW);
         ledcWrite(PWM_CHANNEL_A, 0);
     }
 }
@@ -147,13 +168,35 @@ void motorB(int velocidad) {
         digitalWrite(PIN_BIN2, HIGH);
         ledcWrite(PWM_CHANNEL_B, -velocidad);
     } else {
-        digitalWrite(PIN_BIN1, LOW);
-        digitalWrite(PIN_BIN2, LOW);
+        // Freno activo: IN1 = IN2 = HIGH. Rueda libre: IN1 = IN2 = LOW.
+        digitalWrite(PIN_BIN1, FRENO_ACTIVO ? HIGH : LOW);
+        digitalWrite(PIN_BIN2, FRENO_ACTIVO ? HIGH : LOW);
         ledcWrite(PWM_CHANNEL_B, 0);
     }
 }
 
+// ============================================================
+// RAMPA
+// ============================================================
+// Velocidad que tiene ahora cada rueda (la que se le mando en el ultimo ciclo).
+int velocidadActualA = 0;
+int velocidadActualB = 0;
+
+// Acerca "actual" a "objetivo" sin cambiar mas de un paso por ciclo.
+// Si se aleja de 0 usa RAMPA_ACELERAR; si se acerca a 0 usa RAMPA_FRENAR.
+// Un cambio de sentido primero frena hasta 0 y despues acelera al reves.
+int aplicarRampa(int objetivo, int actual) {
+    bool acelerando = (objetivo > actual) ? (actual >= 0) : (actual <= 0);
+    int paso = acelerando ? RAMPA_ACELERAR : RAMPA_FRENAR;
+    if (objetivo > actual) return min(objetivo, actual + paso);
+    if (objetivo < actual) return max(objetivo, actual - paso);
+    return actual;
+}
+
+// Parada inmediata, sin rampa (seguridad: mando desconectado).
 void detenerMotores() {
+    velocidadActualA = 0;
+    velocidadActualB = 0;
     motorA(0);
     motorB(0);
 }
@@ -317,15 +360,19 @@ void loop() {
     velocidadA = constrain(velocidadA, -VELOCIDAD_MAXIMA, VELOCIDAD_MAXIMA);
     velocidadB = constrain(velocidadB, -VELOCIDAD_MAXIMA, VELOCIDAD_MAXIMA);
 
+    // RAMPA: cada rueda se acerca de a poco a la velocidad pedida
+    velocidadActualA = aplicarRampa(velocidadA, velocidadActualA);
+    velocidadActualB = aplicarRampa(velocidadB, velocidadActualB);
+
     // MOVER MOTORES
 
     // La inversion por robot se aplica adentro de motorA/motorB
     // (constantes INVERTIR_A / INVERTIR_B arriba).
-    motorA(velocidadA);
-    motorB(velocidadB);
+    motorA(velocidadActualA);
+    motorB(velocidadActualB);
 
     // DEBUG (Solo imprime si hay movimiento para no saturar)
-    if (avance != 0 || giro != 0) {
+    if (avance != 0 || giro != 0 || velocidadActualA != 0 || velocidadActualB != 0) {
         Serial.print("R2: ");
         Serial.print(gatilloAdelante);
         Serial.print(" | L2: ");
@@ -333,9 +380,9 @@ void loop() {
         Serial.print(" | X(Giro): ");
         Serial.print(ejeX);
         Serial.print(" | MotorA: ");
-        Serial.print(velocidadA);
+        Serial.print(velocidadActualA);
         Serial.print(" | MotorB: ");
-        Serial.println(velocidadB);
+        Serial.println(velocidadActualB);
     }
 
     delay(20);
