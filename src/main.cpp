@@ -1,0 +1,346 @@
+#include <Arduino.h>
+#include <Bluepad32.h>
+
+// ============================================================
+// PINES ESP32 -> TB6612FNG
+// ============================================================
+const int PIN_PWMA = 2;
+const int PIN_AIN1 = 16;
+const int PIN_AIN2 = 4;
+
+const int PIN_PWMB = 19;
+const int PIN_BIN1 = 5;
+const int PIN_BIN2 = 18;
+
+const int PIN_STBY = 17;
+
+// ============================================================
+// PWM
+// ============================================================
+const int PWM_FREQ = 10000;
+const int PWM_RESOLUTION = 8;
+const int PWM_CHANNEL_A = 0;
+const int PWM_CHANNEL_B = 1;
+
+// ============================================================
+// CONFIGURACION CONTROL
+// ============================================================
+// CONDUCCION:
+//   R2 = avanzar, L2 = retroceder (analogicos: mas apretado = mas rapido).
+//   Stick izquierdo (eje X) = giro.
+//   - Con un gatillo apretado: gira mientras se mueve (la rueda del lado
+//     hacia donde giras va mas lenta).
+//   - Sin gatillos: gira sobre su propio eje.
+//
+// Bluepad32 entrega el stick de -511 a 512 y los gatillos de 0 a 1023.
+// Zona muerta del stick X (tiene drift). Calibracion: mirar en el monitor
+// serie los valores en reposo y poner la zona unos 20-30 puntos por encima
+// del maximo observado.
+const int ZONA_MUERTA_X = 90;
+
+// Zona muerta de los gatillos (0 a 1023).
+const int ZONA_MUERTA_GATILLO = 40;
+
+// Velocidad maxima (0 a 255).
+const int VELOCIDAD_MAXIMA = 255;
+
+// Velocidad maxima al girar sobre su propio eje (0 a 255).
+const int VELOCIDAD_GIRO_SOBRE_EJE = 255;
+
+// Que tan cerrado gira en marcha, con el stick a fondo:
+//   0.0 = la rueda de adentro queda frenada (curva suave)
+//   1.0 = la rueda de adentro va a la misma velocidad pero al reves (muy cerrado)
+const float CIERRE_GIRO_EN_MARCHA = 0.0;
+
+const float FACTOR_A = 1.00;
+const float FACTOR_B = 1.00;
+
+// ============================================================
+// QUE ROBOT ES ESTE
+// ============================================================
+// Normalmente lo define platformio.ini con -D ROBOT=1 / -D ROBOT=2.
+// Este bloque es por si se compila sin ese flag (Arduino IDE): cambiar
+// el numero a mano antes de flashear.
+#ifndef ROBOT
+#define ROBOT 1
+#endif
+
+// ============================================================
+// CORRECCION DE MOTORES AL REVES
+// ============================================================
+// Si el robot avanza cuando deberia retroceder, o gira para el lado
+// equivocado, invertir el motor que corresponda y volver a flashear.
+// No hace falta tocar cables.
+#if ROBOT == 1
+const bool INVERTIR_A = false;
+const bool INVERTIR_B = false;
+const bool invertir_giro = true;
+#elif ROBOT == 2
+const bool INVERTIR_A = true;
+const bool INVERTIR_B = true;
+#else
+const bool INVERTIR_A = false;
+const bool INVERTIR_B = false;
+#endif
+
+// MAC del unico control permitido para ESTE robot.
+// Dejar en ceros la primera vez: el ESP32 acepta cualquier control e
+// imprime su MAC por serie. Copiarla aca, volver a flashear, y desde
+// entonces solo ese control puede manejar este robot.
+
+#if ROBOT == 1
+const uint8_t MAC_PERMITIDA[6] = {0x90, 0xB6, 0x85, 0x12, 0x9A, 0x65};  // control 1
+#elif ROBOT == 2
+const uint8_t MAC_PERMITIDA[6] = {0x58, 0x10, 0x31, 0x7E, 0x52, 0x55};  // control 2
+#else
+const uint8_t MAC_PERMITIDA[6] = {0, 0, 0, 0, 0, 0};  // acepta cualquiera
+#endif
+
+// Puntero para guardar el control de PS5
+ControllerPtr miControl = nullptr;
+
+bool macEsCero(const uint8_t* mac) {
+    for (int i = 0; i < 6; i++) if (mac[i] != 0) return false;
+    return true;
+}
+
+bool macCoincide(const uint8_t* a, const uint8_t* b) {
+    for (int i = 0; i < 6; i++) if (a[i] != b[i]) return false;
+    return true;
+}
+
+// ============================================================
+// MOTOR A (IZQUIERDO)
+// ============================================================
+void motorA(int velocidad) {
+    if (INVERTIR_A) velocidad = -velocidad;
+    velocidad = constrain(velocidad, -255, 255);
+    if (velocidad > 0) {
+        digitalWrite(PIN_AIN1, HIGH);
+        digitalWrite(PIN_AIN2, LOW);
+        ledcWrite(PWM_CHANNEL_A, velocidad);
+    } else if (velocidad < 0) {
+        digitalWrite(PIN_AIN1, LOW);
+        digitalWrite(PIN_AIN2, HIGH);
+        ledcWrite(PWM_CHANNEL_A, -velocidad);
+    } else {
+        digitalWrite(PIN_AIN1, LOW);
+        digitalWrite(PIN_AIN2, LOW);
+        ledcWrite(PWM_CHANNEL_A, 0);
+    }
+}
+
+// ============================================================
+// MOTOR B (DERECHO)
+// ============================================================
+void motorB(int velocidad) {
+    if (INVERTIR_B) velocidad = -velocidad;
+    velocidad = constrain(velocidad, -255, 255);
+    if (velocidad > 0) {
+        digitalWrite(PIN_BIN1, HIGH);
+        digitalWrite(PIN_BIN2, LOW);
+        ledcWrite(PWM_CHANNEL_B, velocidad);
+    } else if (velocidad < 0) {
+        digitalWrite(PIN_BIN1, LOW);
+        digitalWrite(PIN_BIN2, HIGH);
+        ledcWrite(PWM_CHANNEL_B, -velocidad);
+    } else {
+        digitalWrite(PIN_BIN1, LOW);
+        digitalWrite(PIN_BIN2, LOW);
+        ledcWrite(PWM_CHANNEL_B, 0);
+    }
+}
+
+void detenerMotores() {
+    motorA(0);
+    motorB(0);
+}
+
+// ============================================================
+// PROCESAMIENTO DE ENTRADAS
+// ============================================================
+// Stick: aplica zona muerta y reescala desde el borde de la zona hasta 512.
+// Asi el centro da exactamente 0 y no hay salto al salir de la zona muerta.
+int procesarEje(int valor, int zonaMuerta) {
+    if (abs(valor) < zonaMuerta) return 0;
+    int signo = (valor > 0) ? 1 : -1;
+    int magnitud = map(abs(valor), zonaMuerta, 512, 0, VELOCIDAD_MAXIMA);
+    return signo * constrain(magnitud, 0, VELOCIDAD_MAXIMA);
+}
+
+// Gatillo (0 a 1023): zona muerta y reescala a 0..VELOCIDAD_MAXIMA.
+int procesarGatillo(int valor) {
+    if (valor < ZONA_MUERTA_GATILLO) return 0;
+    int magnitud = map(valor, ZONA_MUERTA_GATILLO, 1023, 0, VELOCIDAD_MAXIMA);
+    return constrain(magnitud, 0, VELOCIDAD_MAXIMA);
+}
+
+// ============================================================
+// EVENTOS BLUEPAD32 (PS5)
+// ============================================================
+void onConnectedController(ControllerPtr ctl) {
+    ControllerProperties p = ctl->getProperties();
+    Serial.printf("Control detectado, MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  p.btaddr[0], p.btaddr[1], p.btaddr[2],
+                  p.btaddr[3], p.btaddr[4], p.btaddr[5]);
+
+    // FILTRO POR MAC: si hay una MAC configurada y no coincide, rechazo
+    if (!macEsCero(MAC_PERMITIDA) && !macCoincide(p.btaddr, MAC_PERMITIDA)) {
+        Serial.println("Control NO autorizado para este robot, rechazado.");
+        ctl->disconnect();
+        return;
+    }
+
+    if (miControl == nullptr) {
+        miControl = ctl;
+        // Ya tengo mi control: no acepto conexiones nuevas
+        BP32.enableNewBluetoothConnections(false);
+        Serial.println();
+        Serial.println("==============================");
+        Serial.println("MANDO PS5 CONECTADO");
+        Serial.println("==============================");
+    } else {
+        // Ya hay un control asignado, rechazo este
+        ctl->disconnect();
+    }
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+    if (miControl == ctl) {
+        miControl = nullptr;
+        detenerMotores();
+        // Vuelvo a aceptar conexiones para poder reconectar
+        BP32.enableNewBluetoothConnections(true);
+        Serial.println();
+        Serial.println("==============================");
+        Serial.println("MANDO PS5 DESCONECTADO");
+        Serial.println("MOTORES DETENIDOS");
+        Serial.println("==============================");
+    }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    pinMode(PIN_AIN1, OUTPUT);
+    pinMode(PIN_AIN2, OUTPUT);
+    pinMode(PIN_BIN1, OUTPUT);
+    pinMode(PIN_BIN2, OUTPUT);
+    pinMode(PIN_STBY, OUTPUT);
+    digitalWrite(PIN_STBY, HIGH);
+
+    ledcSetup(PWM_CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PIN_PWMA, PWM_CHANNEL_A);
+
+    ledcSetup(PWM_CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PIN_PWMB, PWM_CHANNEL_B);
+
+    detenerMotores();
+
+    // Iniciar Bluepad32
+    BP32.setup(&onConnectedController, &onDisconnectedController);
+
+    // Descomentar solo en el primer flasheo si el control no conecta,
+    // borra pareos viejos. Despues volver a comentar.
+    // BP32.forgetBluetoothKeys();
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("ESP32 + TB6612 + PS5 (Bluepad32)");
+    Serial.println("==============================");
+    Serial.println("Pon tu control de PS5 en modo emparejamiento (Create + PS)...");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+    // Actualizar datos del Bluetooth
+    BP32.update();
+
+    // SEGURIDAD: SIN MANDO = MOTORES DETENIDOS
+    if (!miControl || !miControl->isConnected()) {
+        detenerMotores();
+        delay(50);
+        return;
+    }
+
+    // LEER ENTRADAS
+    // R2 = throttle (0 a 1023), L2 = brake (0 a 1023), stick izq X (-511 a 512)
+    int gatilloAdelante = procesarGatillo(miControl->throttle());
+    int gatilloAtras    = procesarGatillo(miControl->brake());
+    int ejeX            = miControl->axisX();
+    if (invertir_giro) ejeX = -ejeX;
+
+    // AVANCE NETO: R2 suma, L2 resta (positivo = adelante, negativo = atras)
+    int avance = gatilloAdelante - gatilloAtras;
+
+    // GIRO: positivo = derecha, negativo = izquierda
+    int giro = procesarEje(ejeX, ZONA_MUERTA_X);
+
+    int velocidadA;  // izquierdo
+    int velocidadB;  // derecho
+
+    if (avance == 0) {
+        // SIN GATILLOS: giro sobre su propio eje (una rueda para cada lado)
+        int g = map(abs(giro), 0, VELOCIDAD_MAXIMA, 0, VELOCIDAD_GIRO_SOBRE_EJE);
+        g = (giro >= 0) ? g : -g;
+        velocidadA = g;
+        velocidadB = -g;
+    } else {
+        // CON GATILLO: las dos ruedas siguen el avance, y la rueda del lado
+        // hacia el que giras se frena segun cuanto muevas el stick.
+        velocidadA = avance;
+        velocidadB = avance;
+
+        float cuanto = (float)abs(giro) / VELOCIDAD_MAXIMA;          // 0.0 a 1.0
+        float factorInterior = 1.0 - (1.0 + CIERRE_GIRO_EN_MARCHA) * cuanto;
+
+        if (giro > 0) {
+            velocidadB = (int)(avance * factorInterior);   // giro a la derecha
+        } else if (giro < 0) {
+            velocidadA = (int)(avance * factorInterior);   // giro a la izquierda
+        }
+    }
+
+    // CALIBRACION ENTRE MOTORES
+    velocidadA = (int)(velocidadA * FACTOR_A);
+    velocidadB = (int)(velocidadB * FACTOR_B);
+
+    velocidadA = constrain(velocidadA, -VELOCIDAD_MAXIMA, VELOCIDAD_MAXIMA);
+    velocidadB = constrain(velocidadB, -VELOCIDAD_MAXIMA, VELOCIDAD_MAXIMA);
+
+    // MOVER MOTORES
+
+    // La inversion por robot se aplica adentro de motorA/motorB
+    // (constantes INVERTIR_A / INVERTIR_B arriba).
+    motorA(velocidadA);
+    motorB(velocidadB);
+
+    // DEBUG (Solo imprime si hay movimiento para no saturar)
+    if (avance != 0 || giro != 0) {
+        Serial.print("R2: ");
+        Serial.print(gatilloAdelante);
+        Serial.print(" | L2: ");
+        Serial.print(gatilloAtras);
+        Serial.print(" | X(Giro): ");
+        Serial.print(ejeX);
+        Serial.print(" | MotorA: ");
+        Serial.print(velocidadA);
+        Serial.print(" | MotorB: ");
+        Serial.println(velocidadB);
+    }
+
+    delay(20);
+}
+/*void loop() {
+    Serial.println("A adelante");  motorA(150); delay(1500); motorA(0); delay(500);
+    Serial.println("A atras");     motorA(-150); delay(1500); motorA(0); delay(500);
+    Serial.println("B adelante");  motorB(150); delay(1500); motorB(0); delay(500);
+    Serial.println("B atras");     motorB(-150); delay(1500); motorB(0); delay(500);
+}*/
