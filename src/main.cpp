@@ -78,9 +78,11 @@ const bool invertir_giro = true;
 #elif ROBOT == 2
 const bool INVERTIR_A = true;
 const bool INVERTIR_B = true;
+const bool invertir_giro = false;
 #else
 const bool INVERTIR_A = false;
 const bool INVERTIR_B = false;
+const bool invertir_giro = false;
 #endif
 
 // MAC del unico control permitido para ESTE robot.
